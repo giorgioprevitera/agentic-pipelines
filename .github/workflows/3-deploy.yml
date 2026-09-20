@@ -1,0 +1,278 @@
+# =============================================================================
+# Pipeline 3 — Deploy to ECS
+#
+# Triggers:
+#   - Successful completion of pipeline 2 on main
+#   - Manual dispatch (for rollback or forced redeploy)
+#
+# GitHub Secrets required:
+#   AWS_ROLE_DEPLOY  — ARN from bootstrap outputs
+#   AWS_REGION       — e.g. eu-west-1
+#   GEMINI_API_KEY   — from Google AI Studio (free tier)
+#
+# GitHub Variables required:
+#   ECS_CLUSTER      — from Terraform outputs (ecs_cluster_name)
+#   ECS_SERVICE      — from Terraform outputs (ecs_service_name)
+#   ALB_DNS          — from Terraform outputs (alb_dns_name)
+# =============================================================================
+
+name: 3 · Deploy
+
+on:
+  workflow_run:
+    workflows: ["2 · Build & Package"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_uri:
+        description: "Full ECR image URI to deploy (leave empty to use latest)"
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write # for AI agent to open incident issues
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+  ALB_DNS: ${{ vars.ALB_DNS }}
+
+jobs:
+  deploy:
+    name: Deploy to ECS
+    # Only run if the triggering build succeeded on a push (or if manually dispatched)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_DEPLOY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ------------------------------------------------------------------
+      - name: Resolve image URI
+        id: image
+        env:
+          INPUT_IMAGE_URI: ${{ github.event.inputs.image_uri }}
+          TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ -n "$INPUT_IMAGE_URI" ]; then
+            # Manual dispatch — use provided URI
+            IMAGE_URI="$INPUT_IMAGE_URI"
+          elif [ -n "$TRIGGER_SHA" ]; then
+            # Triggered by pipeline 2 — image was tagged with the commit SHA
+            # (In a real setup use workflow_run artifact download)
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/agentic-devops:${TRIGGER_SHA}"
+          else
+            # Manual dispatch with no input — fall back to :latest
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/agentic-devops:latest"
+          fi
+          echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Deploying: $IMAGE_URI"
+
+      # ------------------------------------------------------------------
+      - name: Record current task definition (for rollback)
+        id: current
+        run: |
+          CURRENT_TASK_DEF=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "task-def=$CURRENT_TASK_DEF" >> $GITHUB_OUTPUT
+          echo "Previous task definition: $CURRENT_TASK_DEF"
+
+      # ------------------------------------------------------------------
+      - name: Render new task definition
+        id: render
+        run: |
+          # Start from the task definition the service is running right now,
+          # strip read-only fields, inject the new image URI
+          aws ecs describe-task-definition \
+            --task-definition "${{ steps.current.outputs.task-def }}" \
+            --query 'taskDefinition' \
+            --output json \
+          | jq --arg IMAGE "${{ steps.image.outputs.uri }}" '
+              del(.taskDefinitionArn, .revision, .status,
+                  .requiresAttributes, .compatibilities,
+                  .registeredAt, .registeredBy) |
+              .containerDefinitions[0].image = $IMAGE
+            ' > new-task-def.json
+
+          cat new-task-def.json
+
+      # ------------------------------------------------------------------
+      - name: Register new task definition
+        id: register
+        run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "arn=$NEW_ARN" >> $GITHUB_OUTPUT
+          echo "New task definition: $NEW_ARN"
+
+      # ------------------------------------------------------------------
+      - name: Update ECS service (rolling deploy)
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service  "$ECS_SERVICE" \
+            --task-definition "${{ steps.register.outputs.arn }}"
+
+      # ------------------------------------------------------------------
+      - name: Wait for service stability
+        id: wait
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+          echo "stable=true" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------------
+      - name: Smoke test — hit /health endpoint
+        id: smoke
+        if: steps.wait.outputs.stable == 'true'
+        continue-on-error: true
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 \
+            "http://$ALB_DNS/health")
+          echo "http_code=$HTTP_CODE" >> $GITHUB_OUTPUT
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "healthy=true" >> $GITHUB_OUTPUT
+          else
+            echo "healthy=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ------------------------------------------------------------------
+      - name: Collect CloudWatch logs (on failure)
+        id: logs
+        if: |
+          steps.wait.outputs.stable != 'true' ||
+          steps.smoke.outputs.healthy != 'true'
+        run: |
+          END=$(date -u +%s000)
+          START=$(( END - 300000 ))   # last 5 minutes
+
+          aws logs filter-log-events \
+            --log-group-name "/ecs/agentic-devops" \
+            --start-time "$START" \
+            --end-time   "$END" \
+            --query 'events[].message' \
+            --output text \
+          | tail -100 > deploy_logs.txt || true
+
+          echo "Captured $(wc -l < deploy_logs.txt) log lines"
+
+      # ------------------------------------------------------------------
+      # 🤖 AI AGENT STEP — Deployment Failure Analysis + Rollback Decision
+      # Phase 4 learning objective: fill in this step
+      # ------------------------------------------------------------------
+      - name: AI Agent · Diagnose failure & decide rollback
+        id: ai_decision
+        if: |
+          steps.wait.outputs.stable != 'true' ||
+          steps.smoke.outputs.healthy != 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          LOGS=$(cat deploy_logs.txt 2>/dev/null || echo "no logs captured")
+          IMAGE="${{ steps.image.outputs.uri }}"
+          SMOKE="${{ steps.smoke.outputs.http_code }}"
+
+          # TODO (Phase 4): call Gemini Flash API
+          # Prompt template:
+          #   system: "You are a DevOps SRE. An ECS deployment may have failed.
+          #            Analyze the logs and return JSON:
+          #            { rollback: true|false,
+          #              root_cause: string,
+          #              recommendation: string }"
+          #   user: "Image: $IMAGE\nSmoke test HTTP code: $SMOKE\nLogs:\n$LOGS"
+          #
+          # For now, always rollback on failure (safe default)
+          DECISION_JSON='{"rollback":true,"root_cause":"AI diagnosis not yet implemented","recommendation":"Rolling back as safe default"}'
+
+          echo "decision=$DECISION_JSON" >> $GITHUB_OUTPUT
+          ROLLBACK=$(echo "$DECISION_JSON" | jq -r '.rollback')
+          echo "rollback=$ROLLBACK" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------------
+      - name: Rollback to previous task definition
+        if: steps.ai_decision.outputs.rollback == 'true'
+        run: |
+          echo "Rolling back to: ${{ steps.current.outputs.task-def }}"
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service  "$ECS_SERVICE" \
+            --task-definition "${{ steps.current.outputs.task-def }}"
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+          echo "Rollback complete"
+
+      # ------------------------------------------------------------------
+      - name: Open incident issue
+        if: steps.ai_decision.outputs.rollback == 'true'
+        uses: actions/github-script@v7
+        env:
+          DECISION: ${{ steps.ai_decision.outputs.decision }}
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          SMOKE_CODE: ${{ steps.smoke.outputs.http_code }}
+          PREV_TASK_DEF: ${{ steps.current.outputs.task-def }}
+        with:
+          script: |
+            const d = JSON.parse(process.env.DECISION);
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `🚨 Deploy failed & rolled back — ${context.sha.slice(0, 7)}`,
+              labels: ['incident'],
+              body: [
+                `## Deploy Failure Report`,
+                `**Image:** \`${process.env.IMAGE_URI}\``,
+                `**Smoke test HTTP code:** ${process.env.SMOKE_CODE || 'n/a (service never stabilised)'}`,
+                ``,
+                `## 🤖 AI Analysis`,
+                `**Root cause:** ${d.root_cause}`,
+                `**Recommendation:** ${d.recommendation}`,
+                ``,
+                `## Action taken`,
+                `Rolled back to: \`${process.env.PREV_TASK_DEF}\``,
+              ].join('\n')
+            });
+
+      # ------------------------------------------------------------------
+      - name: Fail pipeline if deployment was unhealthy
+        if: |
+          steps.wait.outputs.stable != 'true' ||
+          steps.smoke.outputs.healthy != 'true'
+        run: |
+          echo "::error::Deployment failed — see incident issue for details"
+          exit 1
+
+      # ------------------------------------------------------------------
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "### ✅ Deployment successful" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ steps.image.outputs.uri }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Smoke test:** HTTP ${{ steps.smoke.outputs.http_code }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Endpoint:** http://$ALB_DNS/health" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,26 @@
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "eu-west-1"
+}
+
+variable "aws_account_id" {
+  description = "Your 12-digit AWS account ID"
+  type        = string
+}
+
+variable "github_org" {
+  description = "GitHub org or username (e.g. my-org)"
+  type        = string
+}
+
+variable "github_repo" {
+  description = "GitHub repository name (e.g. agentic-devops)"
+  type        = string
+}
+
+variable "project" {
+  description = "Short project name used as a prefix for all resources"
+  type        = string
+  default     = "agentic-devops"
+}

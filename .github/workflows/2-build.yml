@@ -1,0 +1,164 @@
+# =============================================================================
+# Pipeline 2 — Build, Test, Package
+#
+# Triggers:
+#   - Push to main that changes app/**
+#   - Any PR touching app/**
+#
+# GitHub Secrets required:
+#   AWS_ROLE_BUILD   — ARN from bootstrap outputs
+#   AWS_REGION       — e.g. eu-west-1
+#   GEMINI_API_KEY   — from Google AI Studio (free tier)
+#
+# Outputs (written to GitHub step summary + artifact):
+#   image-uri        — full ECR URI with git SHA tag
+# =============================================================================
+
+name: 2 · Build & Package
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**"]
+  pull_request:
+    paths: ["app/**"]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  GO_VERSION: "1.23"
+
+jobs:
+  build:
+    name: Build · Test · Push
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+
+    outputs:
+      image-uri: ${{ steps.push.outputs.image-uri }}
+
+    steps:
+      # ------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # go.sum doesn't exist until you add dependencies; go.mod always does
+          cache-dependency-path: app/go.mod
+
+      # ------------------------------------------------------------------
+      - name: Build
+        run: go build ./...
+
+      # ------------------------------------------------------------------
+      - name: Test
+        id: test
+        # continue-on-error so the AI step runs even on failure
+        continue-on-error: true
+        # explicit shell enables pipefail — without it `| tee` masks a test failure
+        shell: bash
+        run: |
+          go test -v -race -coverprofile=coverage.out ./... 2>&1 | tee test_output.txt
+
+      # ------------------------------------------------------------------
+      # 🤖 AI AGENT STEP — Test Failure Diagnosis
+      # Phase 3 learning objective: fill in this step
+      # ------------------------------------------------------------------
+      - name: AI Agent · Diagnose Test Failure
+        id: ai_diagnosis
+        if: steps.test.outcome == 'failure'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          TEST_OUTPUT=$(cat test_output.txt)
+
+          # TODO (Phase 3): call Gemini Flash API
+          # Prompt template:
+          #   system: "You are a Go expert. A test suite failed.
+          #            Diagnose the root cause and return JSON:
+          #            { root_cause: string,
+          #              suggested_fix: string,
+          #              diff: string  // unified diff format, or empty }"
+          #   user: $TEST_OUTPUT
+          #
+          # For now, emit a placeholder diagnosis
+          DIAGNOSIS_JSON='{"root_cause":"AI diagnosis not yet implemented","suggested_fix":"See test output","diff":""}'
+          echo "diagnosis=$DIAGNOSIS_JSON" >> $GITHUB_OUTPUT
+
+      - name: Post Diagnosis as PR Comment
+        if: steps.test.outcome == 'failure' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          DIAGNOSIS: ${{ steps.ai_diagnosis.outputs.diagnosis }}
+        with:
+          script: |
+            const d = JSON.parse(process.env.DIAGNOSIS);
+            const body = `## 🤖 Test Failure Diagnosis\n\n` +
+              `**Root cause:** ${d.root_cause}\n\n` +
+              `**Suggested fix:** ${d.suggested_fix}\n\n` +
+              (d.diff ? `\`\`\`diff\n${d.diff}\n\`\`\`` : '');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      # Fail the job now if tests actually failed
+      - name: Fail on test errors
+        if: steps.test.outcome == 'failure'
+        run: exit 1
+
+      # ------------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_BUILD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ------------------------------------------------------------------
+      - name: Build & Push Docker image
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: agentic-devops
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+
+          # Also tag as latest on main
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            docker tag "$IMAGE_URI" "$REGISTRY/$REPOSITORY:latest"
+            docker push "$REGISTRY/$REPOSITORY:latest"
+          fi
+
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "### ✅ Image pushed" >> $GITHUB_STEP_SUMMARY
+          echo "\`$IMAGE_URI\`" >> $GITHUB_STEP_SUMMARY
+
+      # ------------------------------------------------------------------
+      - name: Save image URI for deploy pipeline
+        run: echo "${{ steps.push.outputs.image-uri }}" > /tmp/image-uri.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-uri
+          path: /tmp/image-uri.txt
+          retention-days: 1

@@ -1,0 +1,152 @@
+# =============================================================================
+# Pipeline 1 — Infrastructure Provisioning
+#
+# Triggers:
+#   - Push to main that changes infra/**
+#   - Manual dispatch (for first run or forced apply)
+#
+# GitHub Secrets required:
+#   AWS_ROLE_INFRA   — ARN from bootstrap outputs
+#   AWS_REGION       — e.g. eu-west-1
+#   GEMINI_API_KEY   — from Google AI Studio (free tier)
+# =============================================================================
+
+name: 1 · Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "!infra/bootstrap/**" # bootstrap is run locally, not by CI
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "plan or apply"
+        required: true
+        default: "plan"
+        type: choice
+        options: [plan, apply]
+
+permissions:
+  id-token: write # required for OIDC
+  contents: read
+  pull-requests: write # to post AI review comments
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_VERSION: "1.9.0"
+
+jobs:
+  terraform:
+    name: Terraform ${{ github.event.inputs.action || 'plan' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      # ------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_INFRA }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ------------------------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false # wrapper interferes with output capture
+
+      # ------------------------------------------------------------------
+      - name: Terraform Init
+        run: terraform init
+
+      # ------------------------------------------------------------------
+      - name: Terraform Validate
+        run: terraform validate
+
+      # ------------------------------------------------------------------
+      - name: Terraform Plan
+        id: plan
+        shell: bash # explicit shell enables pipefail, so a failed plan fails the step
+        run: |
+          terraform plan \
+            -out=tfplan \
+            -no-color \
+            2>&1 | tee plan_output.txt
+
+          # Save human-readable plan for AI review
+          terraform show -no-color tfplan > plan_readable.txt
+
+      # ------------------------------------------------------------------
+      # 🤖 AI AGENT STEP — Terraform Plan Review
+      # Phase 2 learning objective: fill in this step
+      # ------------------------------------------------------------------
+      - name: AI Agent · Review Terraform Plan
+        id: ai_review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          PLAN=$(cat plan_readable.txt)
+
+          # TODO (Phase 2): call Gemini Flash API
+          # Prompt template:
+          #   system: "You are a Terraform security and cost reviewer.
+          #            Analyze the plan and return JSON:
+          #            { severity: 'LOW|MEDIUM|HIGH',
+          #              issues: [{severity, resource, description}],
+          #              summary: string }"
+          #   user: $PLAN
+          #
+          # For now, stub returns LOW so the pipeline proceeds
+          REVIEW_JSON='{"severity":"LOW","issues":[],"summary":"AI review not yet implemented — stub pass"}'
+
+          echo "review=$REVIEW_JSON" >> $GITHUB_OUTPUT
+
+          SEVERITY=$(echo "$REVIEW_JSON" | jq -r '.severity')
+          echo "severity=$SEVERITY" >> $GITHUB_OUTPUT
+
+          if [ "$SEVERITY" = "HIGH" ]; then
+            echo "::error::AI review found HIGH severity issues — blocking apply"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # Only fires on pull_request events. Add a `pull_request:` trigger (and
+      # a plan-only IAM role) when you want plan reviews on PRs.
+      - name: Post AI Review as PR Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          REVIEW: ${{ steps.ai_review.outputs.review }}
+        with:
+          script: |
+            const review = JSON.parse(process.env.REVIEW);
+            const body = `## 🤖 Terraform Plan AI Review\n\n` +
+              `**Severity:** ${review.severity}\n\n` +
+              `**Summary:** ${review.summary}\n\n` +
+              (review.issues.length
+                ? `### Issues\n` + review.issues.map(i =>
+                    `- **[${i.severity}]** \`${i.resource}\`: ${i.description}`
+                  ).join('\n')
+                : '_No issues found._');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      # ------------------------------------------------------------------
+      - name: Terraform Apply
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        run: terraform apply -auto-approve tfplan

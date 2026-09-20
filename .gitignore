@@ -1,0 +1,19 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.terraform.lock.hcl
+infra/bootstrap/terraform.tfvars
+infra/terraform.tfvars
+
+# Go
+app/coverage.out
+app/server
+
+# Misc
+*.DS_Store
+plan_output.txt
+plan_readable.txt
+test_output.txt
+deploy_logs.txt
