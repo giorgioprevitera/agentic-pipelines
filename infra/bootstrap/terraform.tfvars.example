@@ -10,4 +10,5 @@ aws_region     = "eu-west-1"
 # Value of sub_claim_prefix from:
 #   gh api repos/<org>/<repo>/actions/oidc/customization/sub
 # github_sub_prefix = "repo:my-org@123456/agentic-pipelines@987654321"
+#
 project        = "agentic-pipelines"
