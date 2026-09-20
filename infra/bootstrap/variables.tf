@@ -19,6 +19,12 @@ variable "github_repo" {
   type        = string
 }
 
+variable "github_sub_prefix" {
+  description = "OIDC subject prefix; use sub_claim_prefix from `gh api repos/<org>/<repo>/actions/oidc/customization/sub`. Empty = repo:<org>/<repo>"
+  type        = string
+  default     = ""
+}
+
 variable "project" {
   description = "Short project name used as a prefix for all resources"
   type        = string

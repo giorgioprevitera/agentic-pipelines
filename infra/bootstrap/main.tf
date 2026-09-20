@@ -42,6 +42,15 @@ resource "aws_iam_openid_connect_provider" "github" {
 # -----------------------------------------------------------------------------
 # Shared trust policy factory
 # -----------------------------------------------------------------------------
+locals {
+  # New GitHub repos use an "immutable" OIDC subject that embeds numeric IDs,
+  # e.g. repo:owner@123/name@456:ref:refs/heads/main. Set github_sub_prefix to
+  # the value of `sub_claim_prefix` from:
+  #   gh api repos/<org>/<repo>/actions/oidc/customization/sub
+  # Leave it empty for older repos using the name-based subject.
+  sub_prefix = var.github_sub_prefix != "" ? var.github_sub_prefix : "repo:${var.github_org}/${var.github_repo}"
+}
+
 data "aws_iam_policy_document" "github_trust" {
   for_each = {
     infra  = "ref:refs/heads/main" # infra pipeline: main branch only
@@ -68,7 +77,8 @@ data "aws_iam_policy_document" "github_trust" {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
       # e.g. repo:my-org/my-repo:ref:refs/heads/main
-      values = ["repo:${var.github_org}/${var.github_repo}:${each.value}"]
+      #  or  repo:my-org@123/my-repo@456:ref:refs/heads/main (immutable subject)
+      values = ["${local.sub_prefix}:${each.value}"]
     }
   }
 }
