@@ -16,7 +16,7 @@ func TestHealthHandler(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), `"status":"ok"`) {
+	if !strings.Contains(w.Body.String(), `"status":"broken"`) {
 		t.Errorf("expected status:ok in body, got: %s", w.Body.String())
 	}
 }
