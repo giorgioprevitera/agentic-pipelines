@@ -5,7 +5,7 @@ variable "aws_region" {
 
 variable "project" {
   type    = string
-  default = "agentic-devops"
+  default = "agentic-pipelines"
 }
 
 variable "container_port" {

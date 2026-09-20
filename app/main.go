@@ -60,7 +60,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	fmt.Fprintln(w, "agentic-devops hello world service")
+	fmt.Fprintln(w, "agentic-pipelines hello world service")
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {

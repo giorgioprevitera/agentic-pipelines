@@ -21,10 +21,10 @@
 
 terraform {
   backend "s3" {
-    bucket         = "agentic-devops-tfstate" # change to your bucket name
+    bucket         = "agentic-pipelines-tfstate" # change to your bucket name
     key            = "main/terraform.tfstate"
     region         = "eu-west-1"
-    dynamodb_table = "agentic-devops-tflock"
+    dynamodb_table = "agentic-pipelines-tflock"
     encrypt        = true
   }
 }

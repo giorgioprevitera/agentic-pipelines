@@ -76,11 +76,11 @@ jobs:
             # Triggered by pipeline 2 — image was tagged with the commit SHA
             # (In a real setup use workflow_run artifact download)
             ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-            IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/agentic-devops:${TRIGGER_SHA}"
+            IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/agentic-pipelines:${TRIGGER_SHA}"
           else
             # Manual dispatch with no input — fall back to :latest
             ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-            IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/agentic-devops:latest"
+            IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/agentic-pipelines:latest"
           fi
           echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
           echo "Deploying: $IMAGE_URI"
@@ -173,7 +173,7 @@ jobs:
           START=$(( END - 300000 ))   # last 5 minutes
 
           aws logs filter-log-events \
-            --log-group-name "/ecs/agentic-devops" \
+            --log-group-name "/ecs/agentic-pipelines" \
             --start-time "$START" \
             --end-time   "$END" \
             --query 'events[].message' \

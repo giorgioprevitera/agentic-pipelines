@@ -135,7 +135,7 @@ jobs:
         id: push
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          REPOSITORY: agentic-devops
+          REPOSITORY: agentic-pipelines
           IMAGE_TAG: ${{ github.sha }}
         run: |
           IMAGE_URI="$REGISTRY/$REPOSITORY:$IMAGE_TAG"

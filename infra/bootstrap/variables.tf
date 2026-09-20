@@ -15,7 +15,7 @@ variable "github_org" {
 }
 
 variable "github_repo" {
-  description = "GitHub repository name (e.g. agentic-devops)"
+  description = "GitHub repository name (e.g. agentic-pipelines)"
   type        = string
 }
 
@@ -28,5 +28,5 @@ variable "github_sub_prefix" {
 variable "project" {
   description = "Short project name used as a prefix for all resources"
   type        = string
-  default     = "agentic-devops"
+  default     = "agentic-pipelines"
 }
