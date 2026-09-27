@@ -32,8 +32,9 @@ module "vpc" {
   public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
   private_subnets = ["10.0.11.0/24", "10.0.12.0/24"]
 
-  enable_nat_gateway   = true
-  single_nat_gateway   = true # one NAT keeps costs low for learning
+  # No NAT gateway: it is the slowest and most expensive resource here.
+  # ECS tasks run in the public subnets instead (see aws_ecs_service.app).
+  enable_nat_gateway   = false
   enable_dns_hostnames = true
 }
 
@@ -170,6 +171,9 @@ resource "aws_lb_target_group" "app" {
   vpc_id      = module.vpc.vpc_id
   target_type = "ip"
 
+  # Default is 300s, and terraform destroy waits for it while ECS drains
+  deregistration_delay = 30
+
   health_check {
     path                = "/health"
     healthy_threshold   = 2
@@ -197,7 +201,7 @@ resource "aws_ecs_cluster" "main" {
 
   setting {
     name  = "containerInsights"
-    value = "enabled"
+    value = "disabled" # Container Insights adds extra metrics/log charges
   }
 }
 
@@ -239,13 +243,16 @@ resource "aws_ecs_service" "app" {
   name            = var.project
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = 2
+  desired_count   = 1
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = module.vpc.private_subnets
+    # Public subnets + public IP replace the NAT gateway: tasks reach ECR and
+    # CloudWatch via the internet gateway. Inbound is still limited to the ALB
+    # by the ecs security group, so the tasks aren't reachable directly.
+    subnets          = module.vpc.public_subnets
     security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = false
+    assign_public_ip = true
   }
 
   load_balancer {

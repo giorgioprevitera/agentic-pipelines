@@ -17,3 +17,5 @@ plan_output.txt
 plan_readable.txt
 test_output.txt
 deploy_logs.txt
+NOTES.md
+.envrc

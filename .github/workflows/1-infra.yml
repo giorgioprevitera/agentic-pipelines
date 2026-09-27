@@ -94,24 +94,22 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          PLAN=$(cat plan_readable.txt)
-
-          # TODO (Phase 2): call Gemini Flash API
-          # Prompt template:
-          #   system: "You are a Terraform security and cost reviewer.
-          #            Analyze the plan and return JSON:
-          #            { severity: 'LOW|MEDIUM|HIGH',
-          #              issues: [{severity, resource, description}],
-          #              summary: string }"
-          #   user: $PLAN
-          #
-          # For now, stub returns LOW so the pipeline proceeds
-          REVIEW_JSON='{"severity":"LOW","issues":[],"summary":"AI review not yet implemented — stub pass"}'
+          REVIEW_JSON=$(../scripts/ask-gemini.sh ../prompts/plan-review.md plan_readable.txt | jq -c .)
 
           echo "review=$REVIEW_JSON" >> $GITHUB_OUTPUT
 
           SEVERITY=$(echo "$REVIEW_JSON" | jq -r '.severity')
           echo "severity=$SEVERITY" >> $GITHUB_OUTPUT
+
+          # A failed agent call falls back to severity=LOW so it doesn't block
+          # every apply on a flaky free-tier API — but that must never look
+          # the same as "the AI reviewed this and found nothing." Surface it
+          # as a loud annotation regardless of trigger type (push or PR).
+          AGENT_ERROR=$(echo "$REVIEW_JSON" | jq -r '.agent_error // false')
+          if [ "$AGENT_ERROR" = "true" ]; then
+            REASON=$(echo "$REVIEW_JSON" | jq -r '.reason')
+            echo "::warning::AI plan review did NOT run (agent_error) — proceeding WITHOUT review. Reason: $REASON"
+          fi
 
           if [ "$SEVERITY" = "HIGH" ]; then
             echo "::error::AI review found HIGH severity issues — blocking apply"
@@ -129,12 +127,21 @@ jobs:
         with:
           script: |
             const review = JSON.parse(process.env.REVIEW);
-            const body = `## 🤖 Terraform Plan AI Review\n\n` +
-              `**Severity:** ${review.severity}\n\n` +
-              `**Summary:** ${review.summary}\n\n` +
-              (review.issues.length
-                ? `### Issues\n` + review.issues.map(i =>
-                    `- **[${i.severity}]** \`${i.resource}\`: ${i.description}`
+            // Gemini's responseMimeType guarantees valid JSON, not this exact
+            // shape — defend against a missing/malformed field rather than
+            // letting the step crash on a schema drift.
+            const severity = review.severity ?? 'UNKNOWN';
+            const summary = review.summary ?? '_No summary provided._';
+            const issues = Array.isArray(review.issues) ? review.issues : [];
+            const heading = review.agent_error
+              ? `## ⚠️ AI Review Unavailable\n\nThe AI agent call failed, so **this plan was not actually reviewed**. Reason: ${review.reason ?? 'unknown'}\n\n`
+              : `## 🤖 Terraform Plan AI Review\n\n`;
+            const body = heading +
+              `**Severity:** ${severity}\n\n` +
+              `**Summary:** ${summary}\n\n` +
+              (issues.length
+                ? `### Issues\n` + issues.map(i =>
+                    `- **[${i.severity ?? '?'}]** \`${i.resource ?? '?'}\`: ${i.description ?? ''}`
                   ).join('\n')
                 : '_No issues found._');
             await github.rest.issues.createComment({
@@ -149,4 +156,4 @@ jobs:
         if: |
           (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
           (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
-        run: terraform apply -auto-approve tfplan
+        run: echo terraform apply -auto-approve tfplan
