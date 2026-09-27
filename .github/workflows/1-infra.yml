@@ -6,9 +6,10 @@
 #   - Manual dispatch (for first run or forced apply)
 #
 # GitHub Secrets required:
-#   AWS_ROLE_INFRA   — ARN from bootstrap outputs
-#   AWS_REGION       — e.g. eu-west-1
-#   GEMINI_API_KEY   — from Google AI Studio (free tier)
+#   AWS_ROLE_INFRA      — ARN from bootstrap outputs (plan+apply on main)
+#   AWS_ROLE_INFRA_PLAN — ARN from bootstrap outputs (read-only, PRs only)
+#   AWS_REGION          — e.g. eu-west-1
+#   GEMINI_API_KEY      — from Google AI Studio (free tier)
 # =============================================================================
 
 name: 1 · Infrastructure
@@ -19,6 +20,10 @@ on:
     paths:
       - "infra/**"
       - "!infra/bootstrap/**" # bootstrap is run locally, not by CI
+  pull_request:
+    paths:
+      - "infra/**"
+      - "!infra/bootstrap/**"
   workflow_dispatch:
     inputs:
       action:
@@ -54,7 +59,10 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_INFRA }}
+          # PRs get a read-only role (can plan, cannot apply); push/dispatch
+          # on main get the full role. Least privilege: a PR should never be
+          # able to touch real infrastructure.
+          role-to-assume: ${{ github.event_name == 'pull_request' && secrets.AWS_ROLE_INFRA_PLAN || secrets.AWS_ROLE_INFRA }}
           aws-region: ${{ env.AWS_REGION }}
 
       # ------------------------------------------------------------------
@@ -117,8 +125,6 @@ jobs:
           fi
 
       # ------------------------------------------------------------------
-      # Only fires on pull_request events. Add a `pull_request:` trigger (and
-      # a plan-only IAM role) when you want plan reviews on PRs.
       - name: Post AI Review as PR Comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
