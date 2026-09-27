@@ -139,10 +139,11 @@ resource "aws_security_group" "ecs" {
   vpc_id      = module.vpc.vpc_id
 
   ingress {
-    from_port       = var.container_port
-    to_port         = var.container_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
+    from_port = var.container_port
+    to_port   = var.container_port
+    protocol  = "tcp"
+    # security_groups = [aws_security_group.alb.id]
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
