@@ -162,6 +162,132 @@ jobs:
             });
 
       # ------------------------------------------------------------------
+      # 🤖 AI AGENT STEP — Propose a fix for HIGH findings
+      # Only runs on PRs, and only when a HIGH issue was found (ai_review
+      # exited 1 in that case, so !cancelled() is required here too). Locates
+      # each HIGH issue's resource in the .tf source via brace-matching, asks
+      # Gemini for a corrected block, and posts the result as a PR *review*
+      # (not just a comment) — nothing is applied automatically, you read the
+      # suggestion and manually edit + push if you agree with it.
+      # ------------------------------------------------------------------
+      - name: AI Agent · Propose Fix for HIGH Findings
+        id: ai_fix
+        if: github.event_name == 'pull_request' && !cancelled() && steps.ai_review.outputs.severity == 'HIGH'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REVIEW_JSON: ${{ steps.ai_review.outputs.review }}
+        run: |
+          # Given a resource address like "aws_security_group.web", find its
+          # block in infra/*.tf via brace-counting and print it (or nothing
+          # if not found — e.g. it's inside a module).
+          find_resource_block() {
+            local addr="$1"
+            local type="${addr%%.*}"
+            local name="${addr#*.}"
+            name="${name%%\[*}" # strip a trailing [index] if present
+
+            local f
+            for f in ../infra/*.tf; do
+              [ -f "$f" ] || continue
+              if grep -qF "resource \"$type\" \"$name\" {" "$f"; then
+                awk -v pat="resource \"$type\" \"$name\" {" '
+                  index($0, pat) { start=1; depth=0 }
+                  start {
+                    depth += gsub(/{/, "{")
+                    depth -= gsub(/}/, "}")
+                    print
+                    if (depth == 0) { exit }
+                  }
+                ' "$f"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          HIGH_ISSUES=$(echo "$REVIEW_JSON" | jq -c '[.issues[] | select(.severity == "HIGH")]')
+          COUNT=$(echo "$HIGH_ISSUES" | jq 'length')
+
+          : > fix_context.txt
+          if [ "$COUNT" -eq 0 ]; then
+            # Shouldn't happen if overall severity is HIGH, but never send an
+            # empty prompt to the model.
+            echo "No individual issues were marked HIGH despite overall severity HIGH." >> fix_context.txt
+          else
+            echo "$HIGH_ISSUES" | jq -c '.[]' | while IFS= read -r issue; do
+              RESOURCE=$(echo "$issue" | jq -r '.resource')
+              DESCRIPTION=$(echo "$issue" | jq -r '.description')
+
+              {
+                echo "### Issue: $RESOURCE"
+                echo "Description: $DESCRIPTION"
+                echo ""
+                BLOCK=$(find_resource_block "$RESOURCE" || true)
+                if [ -n "$BLOCK" ]; then
+                  echo "Current Terraform source:"
+                  echo '```hcl'
+                  echo "$BLOCK"
+                  echo '```'
+                else
+                  echo "Current Terraform source: NOT FOUND (resource may be inside a module or declared elsewhere)."
+                fi
+                echo ""
+              } >> fix_context.txt
+            done
+          fi
+
+          FIXES_JSON=$(../scripts/ask-gemini.sh ../prompts/plan-fix.md fix_context.txt | jq -c .)
+          echo "fixes=$FIXES_JSON" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------------
+      - name: Post AI Fix Proposal as PR Review
+        if: github.event_name == 'pull_request' && !cancelled() && steps.ai_review.outputs.severity == 'HIGH'
+        uses: actions/github-script@v7
+        env:
+          FIXES: ${{ steps.ai_fix.outputs.fixes }}
+        with:
+          script: |
+            let parsed;
+            try {
+              parsed = JSON.parse(process.env.FIXES);
+            } catch (e) {
+              parsed = { agent_error: true, reason: 'fix proposal output was not valid JSON' };
+            }
+
+            let body;
+            if (parsed.agent_error) {
+              body = `## ⚠️ AI Fix Proposal Unavailable\n\nCould not generate fix suggestions. Reason: ${parsed.reason ?? 'unknown'}`;
+            } else {
+              const fixes = Array.isArray(parsed.fixes) ? parsed.fixes : [];
+              if (fixes.length === 0) {
+                body = `## 🤖 AI Fix Proposal\n\nNo fixes were proposed for the HIGH findings above.`;
+              } else {
+                body = `## 🤖 AI Fix Proposal for HIGH Findings\n\n` +
+                  `Nothing here is applied automatically — review each suggestion and manually edit + push if you agree.\n\n` +
+                  fixes.map(f => {
+                    const resource = f.resource ?? '?';
+                    const explanation = f.explanation ?? '_no explanation provided_';
+                    const hcl = f.proposed_hcl ?? '';
+                    const codeBlock = hcl
+                      ? `\`\`\`hcl\n${hcl}\n\`\`\``
+                      : '_No precise fix could be generated for this resource — see explanation above._';
+                    return `### \`${resource}\`\n${explanation}\n\n${codeBlock}`;
+                  }).join('\n\n---\n\n');
+              }
+            }
+
+            // A formal review (not just a comment) — shows up under the PR's
+            // "Reviews" section. COMMENT, not APPROVE: this never approves
+            // the PR on your behalf, it only proposes.
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: 'COMMENT',
+              body
+            });
+
+      # ------------------------------------------------------------------
       - name: Terraform Apply
         if: |
           (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
