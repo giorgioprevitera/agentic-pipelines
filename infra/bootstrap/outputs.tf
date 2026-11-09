@@ -8,6 +8,11 @@ output "infra_pipeline_role_arn" {
   value       = aws_iam_role.infra_pipeline.arn
 }
 
+output "infra_plan_pipeline_role_arn" {
+  description = "Set as GH secret: AWS_ROLE_INFRA_PLAN"
+  value       = aws_iam_role.infra_plan_pipeline.arn
+}
+
 output "build_pipeline_role_arn" {
   description = "Set as GH secret: AWS_ROLE_BUILD"
   value       = aws_iam_role.build_pipeline.arn

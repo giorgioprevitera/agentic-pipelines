@@ -56,6 +56,9 @@ data "aws_iam_policy_document" "github_trust" {
     infra  = "ref:refs/heads/main" # infra pipeline: main branch only
     build  = "*"                   # build pipeline: any ref (PRs need ECR push too)
     deploy = "ref:refs/heads/main" # deploy pipeline: main branch only
+    # GitHub's OIDC sub for a pull_request-triggered run is NOT ref-based —
+    # it's always literally "pull_request", regardless of which branch/PR.
+    plan = "pull_request" # plan-only pipeline: any PR
   }
 
   statement {
@@ -96,6 +99,44 @@ resource "aws_iam_role_policy_attachment" "infra_pipeline_admin" {
   role = aws_iam_role.infra_pipeline.name
   # TODO: replace with a scoped policy once you know exactly what Terraform needs
   policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+}
+
+# -----------------------------------------------------------------------------
+# Role: infra-plan-pipeline
+# Permissions: read-only, for `terraform plan` on pull requests. Deliberately
+# NOT the same role as infra-pipeline (which has AdministratorAccess) — a PR
+# should never be able to touch real infrastructure, only read it to compute
+# a diff. Needs ReadOnlyAccess to describe every resource type in the config,
+# plus explicit write access to the DynamoDB lock table, because acquiring
+# the state lock during `plan` is a write API call even though plan itself
+# makes no infrastructure changes.
+# -----------------------------------------------------------------------------
+resource "aws_iam_role" "infra_plan_pipeline" {
+  name               = "${var.project}-infra-plan-pipeline"
+  assume_role_policy = data.aws_iam_policy_document.github_trust["plan"].json
+}
+
+resource "aws_iam_role_policy_attachment" "infra_plan_pipeline_readonly" {
+  role       = aws_iam_role.infra_plan_pipeline.name
+  policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+}
+
+data "aws_iam_policy_document" "state_lock" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:DeleteItem",
+    ]
+    resources = ["arn:aws:dynamodb:${var.aws_region}:${var.aws_account_id}:table/${var.project}-tflock"]
+  }
+}
+
+resource "aws_iam_role_policy" "infra_plan_pipeline_lock" {
+  name   = "state-lock"
+  role   = aws_iam_role.infra_plan_pipeline.name
+  policy = data.aws_iam_policy_document.state_lock.json
 }
 
 # -----------------------------------------------------------------------------
